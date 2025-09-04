@@ -1,0 +1,392 @@
+---
+title: 'ML: Assignment 2'
+author: "Lucia Pauw"
+date: "2025-08-20"
+output: pdf_document
+---
+
+```{r}
+library(knitr)
+library(tidyverse)
+library(caret)
+library(kknn)
+library(tidymodels)
+library(doFuture)
+library(C50)
+```
+
+# k-NN
+
+ - noise variable: dependent on value of k
+ - outliers: dependent on value of k
+ - skew class distribution: dependent on value of k
+ 
+```{r import-data}
+raw <- read.csv("../data/forestCover.csv", na.strings = "?")
+```
+
+```{r knn-data}
+knn_data <- raw %>% 
+  mutate(across(where(is.numeric), # missing values
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))  %>% 
+  select(-Aspect) %>% # correlated feature
+  select(-Water_Level) %>% # constant feature
+  select(-Observation_ID) %>% # unique feature
+  select(-Inclination) %>% # only contains noisy values
+  select(-Cover_Type) # add response back later
+
+resp <- as.factor(raw$Cover_Type)
+ 
+# mixed data
+dummies <- dummyVars("~ .", data = knn_data, fullRank = TRUE)
+knn_data <- predict(dummies, newdata = knn_data)
+
+# different ranges
+knn_data <- scale(knn_data) %>% as.data.frame()
+knn_data$Cover_Type <- resp
+```
+
+``` {r knn-train-test}
+# train/test split
+set.seed(123)
+train_index <- createDataPartition(knn_data$Cover_Type, p = 0.6, list = FALSE)
+# for hyperparamter tuning
+train_knn <- knn_data[train_index, ]
+# for training and evaluating final model
+test_knn <- knn_data[-train_index, ]
+```
+
+```{r knn-cv}
+balanced_accuracy_from_cm <- function(cm_table) {
+  recalls <- diag(cm_table) / rowSums(cm_table)
+  mean(recalls, na.rm = TRUE)
+}
+
+fit_knn_cv_manual <- function(K,
+                              data,
+                              v = 5,
+                              seed = 123,
+                              verbose = TRUE) {
+  
+  folds <- createFolds(data$Cover_Type, k = v, list = TRUE, returnTrain = FALSE)
+
+  per_fold <- vector("list", length(folds))
+  
+  cat("   Candidate: ", K, "\n")
+  start_all <- Sys.time()
+
+  for (i in seq_along(folds)) {
+    if (verbose) cat("Fold", i, "of", length(folds), "\n")
+    
+    # get training and test sets for this fold configuration
+    test_idx  <- folds[[i]]
+    train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+    train_fold <- data[train_idx, , drop = FALSE]
+    test_fold  <- data[test_idx, , drop = FALSE]
+
+    # fit tree on this config's training set
+    t0 <- Sys.time()
+      pred <- FNN::knn(train = as.matrix(select(train_fold, -Cover_Type)),
+                          test = as.matrix(select(test_fold, -Cover_Type)),
+                          cl = train_fold$Cover_Type,
+                          k = K)
+    t1 <- Sys.time()
+
+    truth <- test_fold$Cover_Type
+
+    # get metrics this config's testing set
+    cm <- table(truth, pred)
+    bal_acc <- balanced_accuracy_from_cm(cm)
+    kappa <- as.numeric(caret::confusionMatrix(pred, truth)$overall["Kappa"])
+
+    per_fold[[i]] <- tibble(
+      fold = i,
+      k = K,
+      elapsed_secs = as.numeric(difftime(t1, t0, units = "secs")),
+      bal_accuracy = bal_acc,
+      kappa = kappa,
+      n_train = nrow(train_fold),
+      n_test = nrow(test_fold)
+    )
+  }
+
+  end_all <- Sys.time()
+  per_fold_df <- bind_rows(per_fold)
+
+  summary <- per_fold_df %>%
+    summarise(
+      k = first(K),
+      mean_bal_accuracy = mean(bal_accuracy),
+      sd_bal_accuracy = sd(bal_accuracy),
+      mean_kappa = mean(kappa),
+      sd_kappa = sd(kappa),
+      total_time_secs = as.numeric(difftime(end_all, start_all, units = "secs"))
+    )
+
+  list(per_fold = per_fold_df, summary = summary)
+}
+```
+
+```{r tune-knn}
+Ks <- 2:8
+
+knn_results <- lapply(Ks, function(x) {
+  fit_knn_cv_manual(x, train_knn, v = 5, verbose = TRUE)
+})
+
+knn_sum_res <- bind_rows(
+  lapply(knn_results, function(x) x$summary))
+
+kable(knn_sum_res, digits = 4)
+```
+
+```{r final-mod}
+v <- 5
+k_nn <- 3
+verbose <- TRUE
+
+folds <- createFolds(test_knn$Cover_Type, k = v, list = TRUE, returnTrain = FALSE)
+knn_results <- vector("list", length(folds))
+predictors <- setdiff(names(test_knn), "Cover_Type")
+
+for (i in seq_along(folds)) {
+  if (verbose) cat("Fold", i, "of", length(folds), "\n")
+  
+  # indices and fold datasets
+  train_idx  <- folds[[i]]
+  train_fold <- test_knn[train_idx, , drop = FALSE]
+  test_fold  <- test_knn[-train_idx, , drop = FALSE]
+  
+  # predictions: test and train
+  pred_te_knn <- FNN::knn(train = as.matrix(select(train_fold, -Cover_Type)),
+                          test = as.matrix(select(test_fold, -Cover_Type)),
+                          cl = train_fold$Cover_Type,
+                          k = k_nn)
+  pred_tr_knn <- FNN::knn(train = as.matrix(select(train_fold, -Cover_Type)),
+                          test = as.matrix(select(train_fold, -Cover_Type)),
+                          cl = train_fold$Cover_Type,
+                          k = k_nn)
+  
+  # prepare tibbles for yardstick: ensure same factor levels
+  cl <- factor(train_fold$Cover_Type)
+  levels_cl <- levels(cl)
+  
+  tr_mets_knn <- tibble(
+    truth = factor(train_fold$Cover_Type, levels = levels_cl),
+    est   = factor(pred_tr_knn, levels = levels_cl)
+  )
+  te_mets_knn <- tibble(
+    truth = factor(test_fold$Cover_Type, levels = levels_cl),
+    est   = factor(pred_te_knn, levels = levels_cl)
+  )
+  
+  # compute metrics per fold
+  knn_tr_metrics <- yardstick::metrics(tr_mets_knn, truth = truth, estimate = est) %>%
+    mutate(set = "train", fold = i, k = k_nn)
+  
+  knn_te_metrics <- yardstick::metrics(te_mets_knn, truth = truth, estimate = est) %>%
+    mutate(set = "test", fold = i, k = k_nn)
+  
+  knn_results[[i]] <- bind_rows(knn_tr_metrics, knn_te_metrics)
+}
+
+# combine all folds
+knn_results_df <- bind_rows(knn_results)
+
+# summary: mean and SD for each metric across each fold
+knn_summary <- knn_results_df %>%
+  group_by(set, .metric) %>%
+  summarise(
+    mean = mean(.estimate, na.rm = TRUE),
+    sd   = sd(.estimate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(.metric = ifelse(.metric == "accuracy", "Balanced accuracy", "Cohen's Kappa"))
+
+# view outputs
+knn_results_df
+knn_summary
+```   
+
+# Decision Trees
+
+```{r tree-data}
+tree_data <- raw %>% 
+  select(-Facet) %>% 
+  select(-Water_Level) %>% 
+  mutate(Slope = as.factor(Slope), Soil_Type1 = as.factor(Soil_Type1))
+
+tree_data$Cover_Type <- as.factor(tree_data$Cover_Type)
+```
+
+```{r train-test-split}
+# load("tree_data.RData")
+set.seed(123)
+train_tree <- tree_data[train_index, ]
+test_tree <- tree_data[-train_index, ]
+```
+
+## Quinlan with 5-fold CV
+
+Tuning: select best min_n_cands
+
+```{r manual-cv}
+balanced_accuracy_from_cm <- function(cm_table) {
+  recalls <- diag(cm_table) / rowSums(cm_table)
+  mean(recalls, na.rm = TRUE)
+}
+
+fit_c50_cv_manual <- function(min_n_cand,
+                              data,
+                              v = 5,
+                              seed = 123,
+                              verbose = TRUE) {
+  
+  folds <- createFolds(data$Cover_Type, k = v, list = TRUE, returnTrain = FALSE)
+
+  per_fold <- vector("list", length(folds))
+  
+  cat("   Candidate: ", min_n_cand, "\n")
+  start_all <- Sys.time()
+
+  for (i in seq_along(folds)) {
+    if (verbose) cat("Fold", i, "of", length(folds), "\n")
+    
+    # get training and test sets for this fold configuration
+    test_idx  <- folds[[i]]
+    train_idx <- setdiff(seq_len(nrow(data)), test_idx)
+    train_fold <- data[train_idx, , drop = FALSE]
+    test_fold  <- data[test_idx, , drop = FALSE]
+
+    # fit tree on this config's training set
+    t0 <- Sys.time()
+    fit <- C50::C5.0(Cover_Type ~ ., data = train_fold,
+                     trials = 1,
+                     control = C5.0Control(minCases = min_n_cand))
+    t1 <- Sys.time()
+
+    # get predictions on this config's testing set
+    pred <- predict(fit, newdata = test_fold)
+    truth <- test_fold$Cover_Type
+
+    # get metrics this config's testing set
+    cm <- table(truth, pred)
+    bal_acc <- balanced_accuracy_from_cm(cm)
+    kappa <- as.numeric(caret::confusionMatrix(pred, truth)$overall["Kappa"])
+
+    per_fold[[i]] <- tibble(
+      fold = i,
+      min_n = min_n_cand,
+      elapsed_secs = as.numeric(difftime(t1, t0, units = "secs")),
+      bal_accuracy = bal_acc,
+      kappa = kappa,
+      n_train = nrow(train_fold),
+      n_test = nrow(test_fold)
+    )
+  }
+
+  end_all <- Sys.time()
+  per_fold_df <- bind_rows(per_fold)
+
+  summary <- per_fold_df %>%
+    summarise(
+      min_n = first(min_n),
+      mean_bal_accuracy = mean(bal_accuracy),
+      sd_bal_accuracy = sd(bal_accuracy),
+      mean_kappa = mean(kappa),
+      sd_kappa = sd(kappa),
+      total_time_secs = as.numeric(difftime(end_all, start_all, units = "secs"))
+    )
+
+  list(per_fold = per_fold_df, summary = summary)
+}
+```
+
+``` {r tun-cands}
+candidates <- c(10, 100, 500, 1000, 2000, 5000)
+
+all_results <- lapply(candidates, function(x) {
+  fit_c50_cv_manual(x, train_tree, v = 5, verbose = TRUE)
+})
+
+sum_res <- bind_rows(
+  lapply(all_results, function(x) x$summary))
+
+kable(sum_res, digits = 4)
+```
+
+Training: train with best `min_n_cands`
+
+```{r final-mod-dt}
+v <- 5
+min_n_cands <- 500
+verbose <- TRUE
+
+folds <- createFolds(test_tree$Cover_Type, k = v, list = TRUE, returnTrain = FALSE)
+tree_results <- vector("list", length(folds))
+predictors <- setdiff(names(test_tree), "Cover_Type")
+
+for (i in seq_along(folds)) {
+  if (verbose) cat("Fold", i, "of", length(folds), "\n")
+  
+  # indices and fold datasets
+  train_idx  <- folds[[i]]
+  train_fold <- test_tree[train_idx, , drop = FALSE]
+  test_fold  <- test_tree[-train_idx, , drop = FALSE]
+  
+  # predictions: test and train
+  final_mod <- C50::C5.0(Cover_Type ~ ., 
+                       data = train_fold,
+                       trials = 1,
+                       minCases = min_n_cands)
+
+  # predictions on training and test sets
+  pred_train <- predict(final_mod, newdata = train_fold)
+  pred_test <- predict(final_mod, newdata = test_fold)
+  
+  # prepare tibbles for yardstick: ensure same factor levels
+  cl <- factor(train_fold$Cover_Type)
+  levels_cl <- levels(cl)
+  
+  tr_mets_dt <- tibble(
+    truth = factor(train_fold$Cover_Type, levels = levels_cl),
+    est   = factor(pred_train, levels = levels_cl)
+  )
+  te_mets_dt <- tibble(
+    truth = factor(test_fold$Cover_Type, levels = levels_cl),
+    est   = factor(pred_test, levels = levels_cl)
+  )
+  
+  # compute metrics per fold
+  dt_tr_metrics <- yardstick::metrics(tr_mets_dt, truth = truth, estimate = est) %>%
+    mutate(set = "train", fold = i, k = k_nn)
+  
+  dt_te_metrics <- yardstick::metrics(te_mets_dt, truth = truth, estimate = est) %>%
+    mutate(set = "test", fold = i, k = k_nn)
+  
+  tree_results[[i]] <- bind_rows(dt_tr_metrics, dt_te_metrics)
+}
+
+# combine all folds
+tree_results_df <- bind_rows(tree_results)
+
+# summary: mean and SD for each metric across each fold
+tree_summary <- tree_results_df %>%
+  group_by(set, .metric) %>%
+  summarise(
+    mean = mean(.estimate, na.rm = TRUE),
+    sd   = sd(.estimate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(.metric = ifelse(.metric == "accuracy", "Balanced accuracy", "Cohen's Kappa"))
+
+# view outputs
+tree_results_df
+tree_summary
+```
+
+
+
+
+
+

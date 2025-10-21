@@ -1,0 +1,249 @@
+---
+title: 'Breast Cancer Data: Data quality reports'
+author: "Lucia Pauw"
+date: "2025-10-16"
+output: pdf_document
+---
+
+## Key observations
+
+ - 6 missing ids - can just give them a random number not to lose the observations
+ 
+ - most variables have some missing values, and not necessarily for the same observations. Due to the small size of the dataset, the missing values should be imputed, and not discarded
+ 
+ - the standard deviations of most of the the _mean and _se variables are quite small
+(x e-03)
+
+- scales of variables are quite different. don't need to standardise for random forest
+
+- outliers present for some variables; worst for smoothness_mean
+
+- some imbalance in response variable. not severe, so not corrected for random forest
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(knitr)
+library(psych)
+library(DescTools)
+library(caret)
+library(skimr)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+options(width = 60)
+```
+
+```{r import-data}
+raw_data <- read.table(file = "../data/breastCancer.csv", header = TRUE, na.strings = "?")
+```
+
+```{r convert-to-num}
+non_num_cols <- c("id", "diagnosis", "gender", "Bratio")
+
+raw_data <- raw_data %>% 
+  mutate(across(!all_of(non_num_cols), as.numeric))
+
+str(raw_data)
+```
+
+# Data Quality Report
+
+## Tabular reports
+
+```{r num-cat-id, warning=FALSE}
+card <- sapply(raw_data, function(x) length(unique(x[!is.na(x)])))
+
+cat_names <- data.frame(names = colnames(raw_data),
+                       card = card) %>% 
+  filter(card <= 3) %>% 
+  select(names) %>% 
+  pull
+
+cat_names <- c(cat_names)
+
+num_feat <- raw_data %>% 
+  select(-cat_names)
+
+cat_feat <- raw_data %>% 
+  select(cat_names)
+```
+
+```{r data-qual-num}
+sum_stat <- describe(num_feat, 
+                     quant = c(.25,.75))
+
+perc_mis <- colMeans(is.na(num_feat)) * 100
+
+qual_rep <- data.frame(
+  Feature = colnames(num_feat),
+  Count = sum_stat$n,
+  `% Missing` = perc_mis,
+  Cardinality = sapply(num_feat, n_distinct),
+  `Standard Deviation` = sum_stat$sd
+)
+
+qual_rep2 <- data.frame(Feature = colnames(num_feat),
+  Minimum = sum_stat$min,
+  `First Quartile` = sum_stat$Q0.25,
+  Mean = sum_stat$mean,
+  Median = sum_stat$median,
+  `Third Quartile` = sum_stat$Q0.75,
+  Maximum = sum_stat$max)
+
+colnames(qual_rep) <- c("Feature", "Count", "% Missing",
+                        "Cardinality", "Standard Deviation")
+
+colnames(qual_rep2) <- c("Feature", "Minimum", "First Quartile", "Mean",
+                        "Median", "Third Quartile", "Maximum")
+
+row.names(qual_rep) <- c()
+row.names(qual_rep2) <- c()
+
+knitr::kable(qual_rep, digits = 4,
+             caption = "Data Quality Report for Numerical Descriptive Features (A)")
+
+options(scipen = 999)
+knitr::kable(qual_rep2, digits = 4,
+             caption = "Data Quality Report for Numerical Descriptive Features (B)")
+```
+
+```{r missing-rows}
+which(is.na(raw_data$id))
+which(is.na(raw_data$radius_mean))
+which(is.na(raw_data$area_mean))
+```
+
+
+```{r data-qual-cat}
+cat_feat <- cat_feat %>%
+  mutate(across(everything(), as.factor))
+
+cat_sum <- skim(cat_feat)
+
+get_mode_freq <- function(x) {
+  x <- na.omit(x)
+  tab <- table(x)
+  mode_val <- as.numeric(names(tab)[which.max(tab)])
+  freq <- as.numeric(max(tab))
+  c(mode = mode_val, freq = freq)
+}
+
+modes <- do.call(rbind, lapply(cat_feat, get_mode_freq))
+modes <- as.data.frame(modes)
+
+qual_cat <- data.frame(
+  Feature = colnames(cat_feat),
+  Count = cat_sum$complete_rate * nrow(cat_feat),
+  Missing = 100 * (1- cat_sum$complete_rate),
+  Cardinality = cat_sum$factor.n_unique,
+  Mode = modes$mode,
+  `Mode frequency` = modes$freq,
+  `Mode %` = 100 * modes$freq / nrow(cat_feat)
+)
+
+options(knitr.kable.NA = '-') 
+colnames(qual_cat) <- c("Feature", "Count", "% Missing", "Cardinality",
+                        "Mode", "Mode Frequency", "Mode %")
+row.names(qual_cat) <- c()
+
+knitr::kable(qual_cat, digits = 4,
+             caption = "Data Quality Report for Categorical Descriptive Features")
+```
+
+```{r data-qual-resp}
+resp_tab <- table(cat_feat$diagnosis)
+mode_idx <- which.max(resp_tab)
+mode_val <- names(resp_tab)[mode_idx]
+mode_freq <- resp_tab[mode_idx]
+
+qual_resp <- data.frame(
+  Feature = "diagnosis",
+  Count = sum(is.na(cat_feat$diagnosis)),
+  Missing = mean(is.na(cat_feat$diagnosis)) * 100,
+  Cardinality = n_distinct(cat_feat$diagnosis %>% na.omit()),
+  Mode = mode_val,
+  `Mode frequency` = mode_freq,
+  `Mode %` = 100 * mode_freq / nrow(cat_feat)
+)
+
+colnames(qual_resp) <- c("Feature", "Count", "% Missing", "Cardinality",
+                        "Mode", "Mode Frequency", "Mode %")
+row.names(qual_resp) <- c()
+
+knitr::kable(qual_resp, digits = 4,
+             caption = "Data Quality Report for Response")
+```
+
+## Identifying outliers
+
+```{r}
+otlr_check <- qual_rep2 %>% 
+  mutate(max_thrd = Maximum - `Third Quartile`) %>% 
+  mutate(thrd_med = `Third Quartile` - Median,
+         fst_med = Median - `First Quartile`,
+         fst_min = `First Quartile` - Minimum) %>% 
+  mutate(
+    high_otlr = ifelse(thrd_med == 0 | is.na(thrd_med), NA, max_thrd / thrd_med),
+    low_otlr = ifelse(fst_med == 0 | is.na(fst_med), NA, fst_min / fst_med)) %>%
+    filter(!is.na(high_otlr) | !is.na(low_otlr)) %>% 
+select(Feature, high_otlr, low_otlr)
+
+colnames(otlr_check) <- c("Feature", 
+                          "(Maximum - Third Quartile) / (Third Quartile - Median)",
+                          "(Median - First Quartile) / (First Quartile  -Minimum")
+
+options(scipen = 999)
+kable(otlr_check, digits = 3, caption = "Identifying outliers by interquartile ranges")
+```
+
+```{r cols-w-outliers}
+# detect outliers in a vector
+has_outliers <- function(x) {
+  if(!is.numeric(x)) return(FALSE)
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  any(x < (Q1 - 1.5*IQR) | x > (Q3 + 1.5*IQR), na.rm = TRUE)
+}
+
+# apply to all columns
+outlier_cols <- raw_data %>% 
+  select(where(is.numeric), -id) %>% 
+  keep(has_outliers) %>% 
+  names()
+
+outlier_cols
+```
+
+
+## Visualisations
+
+### Numerical features
+
+```{r viz-num}
+plots_per_page <- 9
+vars <- names(num_feat %>% select(-id))
+
+# loop over variable names in chunks
+for (i in seq(1, length(vars), by = plots_per_page)) {
+  
+  # get variables indexed in this chunk
+  vars_chunk <- vars[i:min(i + plots_per_page - 1, length(vars))]
+  
+  plot_list <- lapply(vars_chunk, function(var) {
+    ggplot(num_feat %>% na.omit(), aes(x = .data[[var]])) +
+      geom_histogram(fill = "#60223b", color = "black", bins = 30) +
+      labs(title = var, x = NULL, y = "Count") +
+      theme_minimal(base_size = 10) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(size = 11))
+  })
+  
+  grid.arrange(grobs = plot_list, ncol = 3, nrow = 3)
+}
+```
